@@ -2,27 +2,46 @@ name: Mirror to GitCode
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅预览（不建仓、不推送）；取消勾选后正式执行"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-gitcode
+  cancel-in-progress: false
 
 jobs:
   mirror:
+    # 配置完成后将 ENABLE_SYNC 设为 true，才开启定时写入。
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_SYNC == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install requests pygithub
-
-      - name: Run mirror script
+      - name: Run offline checks
+        run: python -m unittest discover -s tests -v
+      - name: Scan and sync repositories
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_OWNER: ${{ vars.GH_OWNER || github.repository_owner }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           GC_TOKEN: ${{ secrets.GC_TOKEN }}
-          GC_NAMESPACE: ${{ secrets.GC_NAMESPACE }}
-        run: python .github/scripts/mirror_to_gitcode.py
+          GC_NAMESPACE: ${{ vars.GC_NAMESPACE || secrets.GC_NAMESPACE }}
+          INCLUDE_PRIVATE: ${{ vars.INCLUDE_PRIVATE || 'false' }}
+          REPO_ALLOWLIST: ${{ vars.REPO_ALLOWLIST }}
+          REPO_EXCLUDE: ${{ vars.REPO_EXCLUDE }}
+          MAX_NEW_REPOS: ${{ vars.MAX_NEW_REPOS || '10' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: python scripts/mirror_to_gitcode.py
