@@ -1,0 +1,59 @@
+name: Auto mirror forks to GitLab
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # 每6小时扫描一次，按需改
+  workflow_dispatch: # 支持手动点按钮立刻跑
+
+jobs:
+  scan-and-mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install requests pygithub
+      - name: Run mirror script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GL_TOKEN: ${{ secrets.GL_TOKEN }}
+          GL_NAMESPACE: ${{ secrets.GL_NAMESPACE }}
+        run: |
+          python - <<END
+import os
+import requests
+from github import Github
+
+gh = Github(os.getenv("GITHUB_TOKEN"))
+gl_token = os.getenv("GL_TOKEN")
+gl_ns = os.getenv("GL_NAMESPACE")
+gl_api = "https://gitlab.com/api/v4"
+headers_gl = {"PRIVATE-TOKEN": gl_token}
+
+# 遍历你所有仓库（包含你fork的）
+for repo in gh.get_user().get_repos():
+    repo_name = repo.name
+    gh_url = repo.clone_url
+    # 查gitlab是否存在该项目
+    r = requests.get(f"{gl_api}/projects/{gl_ns}%2F{repo_name}", headers=headers_gl)
+    if r.status_code == 404:
+        print(f"[+] GitLab不存在，新建：{repo_name}")
+        # 在GitLab新建项目
+        create_data = {
+            "name": repo_name,
+            "path": repo_name,
+            "visibility": "public",
+            "import_url": gh_url,
+            "mirror": True,
+            "mirror_overwrites_diverged_branches": True
+        }
+        res = requests.post(f"{gl_api}/projects", headers=headers_gl, json=create_data)
+        if res.status_code in (201, 202):
+            print(f"✅ {repo_name} 创建并开启GitLab拉取镜像")
+        else:
+            print(f"❌ 创建失败 {repo_name}: {res.text}")
+    else:
+        print(f"跳过，已存在：{repo_name}")
+END
