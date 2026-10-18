@@ -224,6 +224,8 @@ def candidates(repositories, targets, records, now):
 
 def check_target(target, source, private):
     # 同名不代表归属；只允许推送带有本脚本标记的镜像。
+    if not isinstance(target, dict):
+        raise RuntimeError("无法读取目标仓库信息，停止同步")
     if target.get("homepage") != source or target.get("description") != MARKER + source:
         raise RuntimeError("同名仓库没有匹配的镜像标记，已保护；请按 README 核对")
     visibility = target.get("private")
@@ -231,6 +233,18 @@ def check_target(target, source, private):
         raise RuntimeError("无法确认目标可见性，停止同步")
     if bool(visibility) != private:
         raise RuntimeError("源与目标可见性不同，停止同步；请先修正目标可见性")
+
+
+def verify_listed_target(gc, namespace, name, listed, source, private):
+    try:
+        check_target(listed, source, private)
+        return listed
+    except RuntimeError:
+        # 列表可能返回空值或摘要值；出现差异先查详情，不能直接认定来源错误。
+        print(f"{name}: 列表核验存在差异，补查仓库详情确认", flush=True)
+        detailed = gc.request(f"/repos/{namespace}/{name}")
+        check_target(detailed, source, private)
+        return detailed
 
 
 def git(args, env):
@@ -362,6 +376,7 @@ def run():
                 private = repo["private"]
                 key = str(repo["id"])
                 target = targets.get(name.lower())
+                listed_fingerprint = target_fingerprint(target) if target is not None else None
                 if target is None and (planned_new if dry_run else created) >= limit:
                     deferred_new += 1
                     continue
@@ -375,10 +390,7 @@ def run():
                     }
                 try:
                     if target is not None:
-                        # 列表字段不足时仅为待处理项补查详情，不把未知信息当作安全。
-                        if any(field not in target for field in ("homepage", "description", "private")):
-                            target = gc.request(f"/repos/{namespace}/{name}")
-                        check_target(target, source, private)
+                        target = verify_listed_target(gc, namespace, name, target, source, private)
                     if dry_run:
                         if target is None:
                             planned_new += 1
@@ -398,7 +410,9 @@ def run():
                         time.sleep(3)
                     message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{name}.git", env)
                     state.data["repos"][key].update({
-                        "source": source_fingerprint(repo), "target": target_fingerprint(target),
+                        "source": source_fingerprint(repo),
+                        # 下轮仍以同一个列表接口比较，避免列表/详情格式差异导致反复补查。
+                        "target": listed_fingerprint or target_fingerprint(target),
                         "checked": time.time(), "pending": False,
                     })
                     results.append(f"{name}: {'轮换核对，' if audit else ''}{message}")

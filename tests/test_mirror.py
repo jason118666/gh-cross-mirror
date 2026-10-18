@@ -117,12 +117,18 @@ class IncrementalTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.state = mirror.SyncState("alice", "alice")
         self.requests = []
+        self.details = {}
 
     def execute(self, effect=None):
         def request(api, path, method="GET", data=None, missing_ok=False):
             self.requests.append((api.base, path, method))
             if path == "/user":
                 return {"login": "alice"}
+            if path.startswith("/repos/alice/"):
+                name = path.rsplit("/", 1)[-1]
+                if name in self.details:
+                    return self.details[name]
+                return next(row for row in self.targets if row["full_name"] == "alice/" + name)
             raise AssertionError(f"不应逐仓查询：{path}")
 
         with patch.dict(os.environ, self.variables, clear=True), patch.object(
@@ -180,6 +186,33 @@ class IncrementalTests(unittest.TestCase):
         self.repos = self.repos[:1]
         self.targets[0]["id"] = 999
         self.targets[0]["description"] = "unrelated"
+        code, urls = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(urls, [])
+
+    def test_incomplete_list_values_use_details_once_then_skip(self):
+        self.repos = self.repos[:1]
+        self.details["repo0"] = dict(self.targets[0])
+        self.targets[0].update({"homepage": "", "description": None})
+        code, urls = self.execute()
+        self.assertEqual(code, 0)
+        self.assertEqual(urls, ["https://github.com/alice/repo0.git"])
+        self.assertEqual(sum(path == "/repos/alice/repo0" for _, path, _ in self.requests), 1)
+        self.assertEqual(self.execute()[1], [])
+        self.assertEqual(sum(path == "/repos/alice/repo0" for _, path, _ in self.requests), 1)
+
+    def test_list_and_details_both_unmanaged_are_never_adopted(self):
+        self.repos = self.repos[:1]
+        self.targets[0].update({"homepage": "", "description": None})
+        code, urls = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(urls, [])
+        self.assertTrue(self.state.data["repos"]["0"]["pending"])
+
+    def test_details_visibility_mismatch_still_blocks_private_upload(self):
+        self.repos = self.repos[:1]
+        self.repos[0]["private"] = True
+        self.variables.update({"INCLUDE_PRIVATE": "true", "GH_PAT": "secret"})
         code, urls = self.execute()
         self.assertEqual(code, 1)
         self.assertEqual(urls, [])
