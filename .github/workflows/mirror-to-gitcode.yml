@@ -1,14 +1,16 @@
-name: Auto mirror forks to GitCode
+name: Mirror to GitCode
+
 on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
-  scan-and-mirror:
+  mirror:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -23,43 +25,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GC_TOKEN: ${{ secrets.GC_TOKEN }}
           GC_NAMESPACE: ${{ secrets.GC_NAMESPACE }}
-        run: |
-          python - <<END
-import os
-import requests
-from github import Github
-
-gh = Github(os.getenv("GITHUB_TOKEN"))
-gc_token = os.getenv("GC_TOKEN")
-gc_ns = os.getenv("GC_NAMESPACE")
-gc_api = "https://api.gitcode.com/api/v5"
-
-headers = {"Authorization": f"Bearer {gc_token}"}
-
-for repo in gh.get_user().get_repos():
-    repo_name = repo.name
-    gh_url = repo.clone_url
-    r = requests.get(f"{gc_api}/repos/{gc_ns}/{repo_name}", headers=headers)
-    if r.status_code == 404:
-        print(f"[+] GitCode不存在，新建仓库：{repo_name}")
-        create_data = {
-            "name": repo_name,
-            "private": False
-        }
-        res = requests.post(f"{gc_api}/user/repos", headers=headers, json=create_data)
-        if res.status_code == 201:
-            print(f"✅ 仓库 {repo_name} 创建成功，准备开启镜像")
-            mirror_data = {
-                "source_url": gh_url,
-                "source_branch": "*"
-            }
-            mirror_res = requests.post(f"{gc_api}/repos/{gc_ns}/{repo_name}/mirror/pull", headers=headers, json=mirror_data)
-            if mirror_res.status_code in (200,201):
-                print(f"✅ {repo_name} 镜像同步已开启！")
-            else:
-                print(f"⚠️ 仓库建好，但开启镜像失败：{mirror_res.text}")
-        else:
-            print(f"❌ 创建仓库失败 {repo_name}: {res.text}")
-    else:
-        print(f"跳过，仓库已存在：{repo_name}")
-END
+        run: python .github/scripts/mirror_to_gitcode.py
