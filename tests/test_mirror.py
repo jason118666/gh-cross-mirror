@@ -1,4 +1,6 @@
+import base64
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -51,8 +53,8 @@ class APITests(unittest.TestCase):
             mirror.check_target({**target, "private": "false"}, source, False)
 
     def test_dry_run_includes_forks_without_writing(self):
-        repos = [{"owner": {"login": "alice"}, "name": name, "private": False, "fork": fork}
-                 for name, fork in (("original", False), ("forked", True))]
+        repos = [{"id": index, "owner": {"login": "alice"}, "name": name, "private": False, "fork": fork}
+                 for index, (name, fork) in enumerate((("original", False), ("forked", True)))]
         calls = []
 
         def request(api, path, method="GET", data=None, missing_ok=False):
@@ -62,17 +64,17 @@ class APITests(unittest.TestCase):
         with patch.dict(os.environ, {"GH_OWNER": "alice", "GC_NAMESPACE": "alice",
                                     "GC_TOKEN": "secret", "DRY_RUN": "true"}, clear=True), patch.object(
             mirror.API, "request", request
-        ), patch.object(mirror.API, "pages", return_value=iter(repos)), patch.object(mirror, "git") as git:
+        ), patch.object(mirror.API, "pages", lambda api, path: iter(repos if "github" in api.base else [])), patch.object(mirror, "git") as git:
             self.assertEqual(mirror.run(), 0)
-            self.assertIn(("/repos/alice/forked", "GET"), calls)
+            self.assertFalse(any(path.startswith("/repos/alice/") for path, _ in calls))
             self.assertTrue(all(method == "GET" for _, method in calls))
             git.assert_not_called()
 
     def test_create_limit_and_private_visibility_gate(self):
         for private in (False, True):
             with self.subTest(private=private):
-                repos = [{"owner": {"login": "alice"}, "name": name,
-                          "private": private, "fork": False} for name in ("one", "two")]
+                repos = [{"id": index, "owner": {"login": "alice"}, "name": name,
+                          "private": private, "fork": False} for index, name in enumerate(("one", "two"))]
                 created = {}
 
                 def request(api, path, method="GET", data=None, missing_ok=False):
@@ -91,7 +93,7 @@ class APITests(unittest.TestCase):
                              "GH_PAT": "secret", "DRY_RUN": "false", "MAX_NEW_REPOS": "1",
                              "INCLUDE_PRIVATE": str(private).lower()}
                 with patch.dict(os.environ, variables, clear=True), patch.object(mirror.API, "request", request), patch.object(
-                    mirror.API, "pages", return_value=iter(repos)
+                    mirror.API, "pages", lambda api, path: iter(repos if "github" in api.base else [])
                 ), patch.object(mirror, "git"), patch.object(mirror.time, "sleep"), patch.object(
                     mirror, "sync_repo", return_value="synced"
                 ) as sync:
@@ -99,6 +101,213 @@ class APITests(unittest.TestCase):
                     self.assertEqual(list(created), ["one"])
                     self.assertEqual(created["one"]["public"], 0 if private else 1)
                     self.assertEqual(sync.call_count, 0 if private else 1)
+
+
+class IncrementalTests(unittest.TestCase):
+    def setUp(self):
+        self.variables = {"GH_OWNER": "alice", "GC_NAMESPACE": "alice", "GC_TOKEN": "secret",
+                          "DRY_RUN": "false", "MAX_SYNC_REPOS": "2"}
+        self.repos = [{"id": i, "owner": {"login": "alice"}, "name": f"repo{i}",
+                       "private": False, "fork": True, "pushed_at": "first", "updated_at": "first",
+                       "default_branch": "main"} for i in range(3)]
+        self.targets = [{"id": i + 10, "full_name": f"alice/repo{i}", "private": False,
+                         "homepage": f"https://github.com/alice/repo{i}",
+                         "description": mirror.MARKER + f"https://github.com/alice/repo{i}"}
+                        for i in range(3)]
+        with patch.dict(os.environ, {}, clear=True):
+            self.state = mirror.SyncState("alice", "alice")
+        self.requests = []
+
+    def execute(self, effect=None):
+        def request(api, path, method="GET", data=None, missing_ok=False):
+            self.requests.append((api.base, path, method))
+            if path == "/user":
+                return {"login": "alice"}
+            raise AssertionError(f"不应逐仓查询：{path}")
+
+        with patch.dict(os.environ, self.variables, clear=True), patch.object(
+            mirror, "SyncState", return_value=self.state
+        ), patch.object(mirror.API, "request", request), patch.object(
+            mirror.API, "pages", lambda api, path: iter(self.repos if "github" in api.base else self.targets)
+        ), patch.object(mirror, "git"), patch.object(
+            mirror, "sync_repo", side_effect=effect, return_value="synced"
+        ) as sync:
+            code = mirror.run()
+            return code, [call.args[0] for call in sync.call_args_list]
+
+    def test_batch_resumes_and_unchanged_repos_skip_git(self):
+        self.assertEqual(len(self.execute()[1]), 2)
+        self.assertEqual(self.execute()[1], ["https://github.com/alice/repo2.git"])
+        self.assertEqual(self.execute()[1], [])
+        self.assertEqual(len(self.state.data["repos"]), 3)
+        self.assertTrue(all(path == "/user" for _, path, _ in self.requests))
+
+    def test_only_changed_repo_is_selected(self):
+        self.variables["MAX_SYNC_REPOS"] = "10"
+        self.execute()
+        self.repos[1]["pushed_at"] = "second"
+        self.assertEqual(self.execute()[1], ["https://github.com/alice/repo1.git"])
+
+    def test_failed_work_remains_pending_and_does_not_starve_other_work(self):
+        code, urls = self.execute([RuntimeError("test failure"), "synced"])
+        self.assertEqual(code, 1)
+        self.assertTrue(self.state.data["repos"]["0"]["pending"])
+        self.assertNotIn("source", self.state.data["repos"]["0"])
+        code, urls = self.execute()
+        self.assertEqual(urls[0], "https://github.com/alice/repo2.git")
+        self.assertFalse(self.state.data["repos"]["0"]["pending"])
+
+    def test_periodic_audit_catches_changes_without_timestamp_update(self):
+        self.variables["MAX_SYNC_REPOS"] = "10"
+        self.execute()
+        self.state.data["repos"]["1"]["checked"] = 1
+        self.assertEqual(self.execute()[1], ["https://github.com/alice/repo1.git"])
+
+    def test_missing_source_preserves_target_and_state(self):
+        self.execute()
+        self.repos = []
+        self.assertEqual(self.execute()[1], [])
+        self.assertEqual(len(self.targets), 3)
+        self.assertEqual(len(self.state.data["repos"]), 2)
+
+    def test_dry_run_does_not_advance_checkpoint(self):
+        self.variables["DRY_RUN"] = "true"
+        self.assertEqual(self.execute()[1], [])
+        self.assertEqual(self.state.data["repos"], {})
+
+    def test_target_recreation_forces_validation(self):
+        self.execute()
+        self.repos = self.repos[:1]
+        self.targets[0]["id"] = 999
+        self.targets[0]["description"] = "unrelated"
+        code, urls = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(urls, [])
+
+    def test_time_budget_defers_and_saves(self):
+        with patch.object(self.state, "save") as save:
+            code, urls = self.execute(mirror.BudgetReached("time budget"))
+            self.assertEqual(code, 0)
+            self.assertEqual(len(urls), 1)
+            save.assert_called_once()
+        self.assertTrue(self.state.data["repos"]["0"]["pending"])
+
+    def test_limit_failure_still_checkpoints_completed_work(self):
+        with patch.object(self.state, "save") as save:
+            with self.assertRaises(mirror.StopRun):
+                self.execute(["synced", mirror.StopRun("rate limited")])
+            save.assert_called_once()
+        self.assertFalse(self.state.data["repos"]["0"]["pending"])
+        self.assertTrue(self.state.data["repos"]["1"]["pending"])
+
+    def test_ten_thousand_repos_use_pages_instead_of_detail_requests(self):
+        count = 10000
+        sources = [{**self.repos[0], "id": i, "name": f"repo{i:05d}"} for i in range(count)]
+        targets = [{**self.targets[0], "id": i, "full_name": f"alice/repo{i:05d}",
+                    "homepage": f"https://github.com/alice/repo{i:05d}",
+                    "description": mirror.MARKER + f"https://github.com/alice/repo{i:05d}"}
+                   for i in range(count)]
+        calls = []
+
+        def request(api, path, method="GET", data=None, missing_ok=False):
+            calls.append((api.base, path))
+            if path == "/user":
+                return {"login": "alice"}
+            self.assertIn("per_page=100", path)
+            page = int(path.rsplit("page=", 1)[-1])
+            rows = sources if "github" in api.base else targets
+            return rows[(page - 1) * 100:page * 100]
+
+        with patch.dict(os.environ, self.variables, clear=True), patch.object(
+            mirror, "SyncState", return_value=self.state
+        ), patch.object(mirror.API, "request", request), patch.object(mirror, "git"), patch.object(
+            mirror, "sync_repo", return_value="synced"
+        ) as sync, patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(mirror.run(), 0)
+        self.assertEqual(sum("github" in base for base, _ in calls), 101)
+        self.assertEqual(sum("gitcode" in base for base, _ in calls), 102)
+        self.assertEqual(sync.call_count, 2)
+
+    def test_audits_get_a_slot_among_continuous_changes(self):
+        repos = [{**self.repos[0], "id": i, "name": f"repo{i}"} for i in range(6)]
+        targets = {r["name"]: {**self.targets[0], "id": r["id"]} for r in repos}
+        last = repos[-1]
+        records = {str(last["id"]): {"source": mirror.source_fingerprint(last),
+                   "target": mirror.target_fingerprint(targets[last["name"]]), "checked": 1}}
+        queue, _ = mirror.candidates(repos, targets, records, 10 * 86400)
+        self.assertEqual(queue[4][0]["id"], last["id"])
+        self.assertTrue(queue[4][1])
+
+
+class StateTests(unittest.TestCase):
+    def encoded(self, data):
+        return {"sha": "old-sha", "encoding": "base64",
+                "content": base64.b64encode(json.dumps(data).encode()).decode()}
+
+    def test_initialization_publishes_complete_branch_last(self):
+        replies = [None, None, {"sha": "tree", "tree": [{"sha": "blob"}]},
+                   {"sha": "commit"}, {"ref": "refs/heads/mirror-state"}]
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alice/control"}, clear=True), patch.object(
+            mirror.API, "request", side_effect=replies
+        ) as request:
+            state = mirror.SyncState("alice", "alice")
+            self.assertEqual(request.call_count, 2)  # 预览只读取，不初始化。
+            state.data["repos"]["1"] = {"name": "demo"}
+            state.save()
+            self.assertEqual(request.call_args.args[0], "/repos/alice/control/git/refs")
+            self.assertEqual(request.call_args.args[2]["sha"], "commit")
+            self.assertEqual(state.sha, "blob")
+            state.save()
+            self.assertEqual(request.call_count, 5)
+
+    def test_load_and_save_use_sha_for_conflict_protection(self):
+        data = {"version": 1, "owner": "alice", "namespace": "alice", "repos": {}}
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alice/control"}, clear=True), patch.object(
+            mirror.API, "request", side_effect=[self.encoded(data), {"content": {"sha": "new-sha"}}]
+        ) as request:
+            state = mirror.SyncState("alice", "alice")
+            state.data["repos"]["1"] = {"pending": True}
+            state.save()
+            payload = request.call_args.args[2]
+            self.assertEqual(payload["sha"], "old-sha")
+            self.assertEqual(payload["branch"], "mirror-state")
+            self.assertEqual(state.sha, "new-sha")
+
+    def test_wrong_context_or_existing_unmanaged_branch_is_rejected(self):
+        wrong = {"version": 1, "owner": "other", "namespace": "alice", "repos": {}}
+        for replies in ([self.encoded(wrong)], [None, {"ref": "exists"}]):
+            with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alice/control"}, clear=True), patch.object(
+                mirror.API, "request", side_effect=replies
+            ), self.assertRaises(ValueError):
+                mirror.SyncState("alice", "alice")
+
+    def test_large_state_uses_blob_fallback(self):
+        data = {"version": 1, "owner": "alice", "namespace": "alice", "repos": {}}
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alice/control"}, clear=True), patch.object(
+            mirror.API, "request", side_effect=[{"sha": "large", "encoding": "none"}, self.encoded(data)]
+        ) as request:
+            mirror.SyncState("alice", "alice")
+            self.assertEqual(request.call_args.args[0], "/repos/alice/control/git/blobs/large")
+
+    def test_failed_save_does_not_claim_checkpoint_was_persisted(self):
+        data = {"version": 1, "owner": "alice", "namespace": "alice", "repos": {}}
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alice/control"}, clear=True), patch.object(
+            mirror.API, "request", side_effect=[self.encoded(data), RuntimeError("conflict")]
+        ):
+            state = mirror.SyncState("alice", "alice")
+            before = state.original
+            state.data["repos"]["1"] = {"pending": True}
+            with self.assertRaises(RuntimeError):
+                state.save()
+            self.assertEqual(state.original, before)
+
+    def test_target_list_filters_other_namespaces(self):
+        rows = [{"full_name": "alice/demo"}, {"full_name": "org/demo"}]
+        self.assertEqual(list(mirror.target_index(rows, "alice")), ["demo"])
+
+    def test_malformed_target_list_is_not_treated_as_missing_repositories(self):
+        with self.assertRaises(RuntimeError):
+            mirror.target_index([{"name": "demo"}], "alice")
 
 
 class GitIntegrationTests(unittest.TestCase):

@@ -11,7 +11,8 @@ on:
         default: true
 
 permissions:
-  contents: read
+  # 仅使用内置令牌，在控制仓库的 mirror-state 分支保存同步进度。
+  contents: write
 
 concurrency:
   group: mirror-to-gitcode
@@ -44,5 +45,6 @@ jobs:
           REPO_ALLOWLIST: ${{ vars.REPO_ALLOWLIST }}
           REPO_EXCLUDE: ${{ vars.REPO_EXCLUDE }}
           MAX_NEW_REPOS: ${{ vars.MAX_NEW_REPOS || '10' }}
+          MAX_SYNC_REPOS: ${{ vars.MAX_SYNC_REPOS || '200' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
         run: python scripts/mirror_to_gitcode.py
