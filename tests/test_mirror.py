@@ -271,6 +271,160 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(queue[4][0]["id"], last["id"])
         self.assertTrue(queue[4][1])
 
+    def enable_upstream(self):
+        self.repos = self.repos[:1]
+        self.variables.update({"SYNC_FORKS": "true", "GH_PAT": "test-token"})
+
+    def test_upstream_is_checked_even_when_our_fork_has_no_changes(self):
+        self.repos = self.repos[:1]
+        self.execute()
+        self.enable_upstream()
+        with patch.object(mirror, "sync_fork", return_value=(self.repos[0], False)) as upstream:
+            code, urls = self.execute()
+        upstream.assert_called_once()
+        self.assertEqual(code, 0)
+        self.assertEqual(urls, [])
+        self.assertFalse(self.state.data["repos"]["0"]["pending"])
+
+    def test_upstream_update_is_mirrored_in_the_same_run(self):
+        self.repos = self.repos[:1]
+        self.execute()
+        self.enable_upstream()
+        refreshed = {**self.repos[0], "pushed_at": "new-upstream-commit"}
+        with patch.object(mirror, "sync_fork", return_value=(refreshed, True)):
+            code, urls = self.execute()
+        self.assertEqual(code, 0)
+        self.assertEqual(urls, ["https://github.com/alice/repo0.git"])
+        self.assertEqual(self.state.data["repos"]["0"]["source"], mirror.source_fingerprint(refreshed))
+
+    def test_upstream_update_forces_mirror_even_if_timestamp_is_not_refreshed_yet(self):
+        self.repos = self.repos[:1]
+        self.execute()
+        self.enable_upstream()
+        with patch.object(mirror, "sync_fork", return_value=(self.repos[0], True)):
+            self.assertEqual(len(self.execute()[1]), 1)
+
+    def test_upstream_conflict_is_red_and_does_not_mirror(self):
+        self.enable_upstream()
+        with tempfile.TemporaryDirectory() as temporary:
+            summary = Path(temporary) / "summary.md"
+            self.variables["GITHUB_STEP_SUMMARY"] = str(summary)
+            with patch.object(mirror, "sync_fork", side_effect=RuntimeError("上游同步冲突")):
+                code, urls = self.execute()
+            report = summary.read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertEqual(urls, [])
+        self.assertTrue(self.state.data["repos"]["0"]["pending"])
+        self.assertIn("结果：失败", report)
+        self.assertIn("上游失败 1", report)
+        self.assertIn("GitCode：未完成", report)
+
+    def test_upstream_preview_performs_no_write(self):
+        self.enable_upstream()
+        self.variables["DRY_RUN"] = "true"
+        with patch.object(mirror, "sync_fork") as upstream:
+            code, urls = self.execute()
+        upstream.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(urls, [])
+        self.assertEqual(self.state.data["repos"], {})
+
+    def test_fork_periodic_audit_is_not_lost_by_upstream_noop_optimization(self):
+        self.repos = self.repos[:1]
+        self.execute()
+        self.enable_upstream()
+        self.state.data["repos"]["0"]["checked"] = 1
+        with patch.object(mirror, "sync_fork", return_value=(self.repos[0], False)):
+            self.assertEqual(len(self.execute()[1]), 1)
+
+    def test_original_and_archived_repos_are_not_upstream_written(self):
+        self.enable_upstream()
+        for fields in ({"fork": False}, {"archived": True}):
+            self.state.data["repos"].clear()
+            self.repos[0].update({"fork": True, "archived": False})
+            self.repos[0].update(fields)
+            with patch.object(mirror, "sync_fork") as upstream:
+                self.execute()
+            upstream.assert_not_called()
+
+    def test_upstream_success_but_gitcode_failure_is_not_reported_as_success(self):
+        self.repos = self.repos[:1]
+        self.execute()
+        old_source = self.state.data["repos"]["0"]["source"]
+        self.enable_upstream()
+        refreshed = {**self.repos[0], "pushed_at": "upstream-new"}
+        with tempfile.TemporaryDirectory() as temporary:
+            summary = Path(temporary) / "summary.md"
+            self.variables["GITHUB_STEP_SUMMARY"] = str(summary)
+            with patch.object(mirror, "sync_fork", return_value=(refreshed, True)):
+                code, _ = self.execute(RuntimeError("GitCode push failed"))
+            report = summary.read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertIn("结果：失败", report)
+        self.assertIn("上游更新 1", report)
+        self.assertIn("上游失败 0", report)
+        self.assertIn("GitCode：未完成", report)
+        self.assertEqual(self.state.data["repos"]["0"]["source"], old_source)
+        self.assertTrue(self.state.data["repos"]["0"]["pending"])
+
+    def test_fork_becoming_private_is_not_uploaded_to_public_target(self):
+        self.enable_upstream()
+        with patch.object(mirror, "sync_fork", return_value=({**self.repos[0], "private": True}, True)):
+            code, urls = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(urls, [])
+
+    def test_upstream_requires_pat_before_any_mutation(self):
+        self.variables["SYNC_FORKS"] = "true"
+        with patch.dict(os.environ, self.variables, clear=True), patch.object(mirror.API, "request") as request:
+            with self.assertRaisesRegex(ValueError, "GH_PAT"):
+                mirror.run()
+            request.assert_not_called()
+
+
+class ForkAPITests(unittest.TestCase):
+    def setUp(self):
+        self.gh = mirror.API("https://api.github.com", "secret")
+        self.repo = {"id": 7, "name": "demo", "owner": {"login": "alice"},
+                     "default_branch": "release/main", "private": False, "fork": True}
+
+    def test_safe_default_branch_merge_and_metadata_refresh(self):
+        refreshed = {**self.repo, "pushed_at": "new"}
+        with patch.object(self.gh, "request", side_effect=[{"merge_type": "fast-forward"}, refreshed]) as request:
+            result, updated = mirror.sync_fork(self.gh, "alice", self.repo)
+        self.assertTrue(updated)
+        self.assertEqual(result, refreshed)
+        self.assertEqual(request.call_args_list[0].args,
+                         ("/repos/alice/demo/merge-upstream", "POST", {"branch": "release/main"}))
+        self.assertEqual(request.call_args_list[1].args, ("/repos/alice/demo",))
+
+    def test_already_current_needs_no_extra_metadata_query(self):
+        with patch.object(self.gh, "request", return_value={"merge_type": "none"}) as request:
+            result, updated = mirror.sync_fork(self.gh, "alice", self.repo)
+        self.assertFalse(updated)
+        self.assertEqual(result, self.repo)
+        self.assertEqual(request.call_count, 1)
+
+    def test_conflict_and_other_errors_are_not_forced_or_retried(self):
+        for status in (409, 422, 404):
+            with self.subTest(status=status), patch.object(
+                self.gh, "request", side_effect=mirror.APIError("POST", status)
+            ) as request:
+                with self.assertRaises(RuntimeError):
+                    mirror.sync_fork(self.gh, "alice", self.repo)
+                self.assertEqual(request.call_count, 1)
+
+    def test_rate_limit_or_permission_failure_stops_run(self):
+        with patch.object(self.gh, "request", side_effect=mirror.StopRun("403")):
+            with self.assertRaises(mirror.StopRun):
+                mirror.sync_fork(self.gh, "alice", self.repo)
+
+    def test_invalid_response_or_changed_identity_blocks_mirroring(self):
+        for replies in ([{}], [{"merge_type": "fast-forward"}, {**self.repo, "id": 999}]):
+            with self.subTest(replies=replies), patch.object(self.gh, "request", side_effect=replies):
+                with self.assertRaises(RuntimeError):
+                    mirror.sync_fork(self.gh, "alice", self.repo)
+
 
 class StateTests(unittest.TestCase):
     def encoded(self, data):

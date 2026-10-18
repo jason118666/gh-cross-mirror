@@ -39,6 +39,7 @@ jobs:
           GH_OWNER: ${{ vars.GH_OWNER || github.repository_owner }}
           GITHUB_TOKEN: ${{ github.token }}
           GH_PAT: ${{ secrets.GH_PAT }}
+          SYNC_FORKS: ${{ vars.SYNC_FORKS || 'true' }}
           GC_TOKEN: ${{ secrets.GC_TOKEN }}
           GC_NAMESPACE: ${{ vars.GC_NAMESPACE || secrets.GC_NAMESPACE }}
           INCLUDE_PRIVATE: ${{ vars.INCLUDE_PRIVATE || 'false' }}

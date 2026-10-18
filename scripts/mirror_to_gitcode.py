@@ -26,6 +26,12 @@ class BudgetReached(RuntimeError):
     """预留时间保存进度，不等 Actions 强制终止。"""
 
 
+class APIError(RuntimeError):
+    def __init__(self, method, status):
+        self.status = status
+        super().__init__(f"API {method} 失败，HTTP {status}")
+
+
 def flag(name, default=False):
     value = os.getenv(name, str(default)).lower()
     if value not in ("true", "false"):
@@ -74,7 +80,7 @@ class API:
                 if error.code >= 500 and attempt + 1 < attempts:
                     time.sleep(2 ** (attempt + 1))
                     continue
-                raise RuntimeError(f"API {method} 失败，HTTP {error.code}") from None
+                raise APIError(method, error.code) from None
             except (URLError, TimeoutError):
                 if attempt + 1 == attempts:
                     raise RuntimeError("API 网络失败；请在下次运行时重新检查") from None
@@ -194,14 +200,15 @@ def target_index(rows, namespace):
     return result
 
 
-def candidates(repositories, targets, records, now):
+def candidates(repositories, targets, records, now, sync_forks=False):
     selected = []
     skipped = 0
     for repo in repositories:
         key = str(repo["id"])
         previous = records.get(key, {})
         target = targets.get(repo["name"].lower())
-        changed = (target is None or previous.get("source") != source_fingerprint(repo)
+        changed = ((sync_forks and repo.get("fork", False) and not repo.get("archived", False))
+                   or target is None or previous.get("source") != source_fingerprint(repo)
                    or previous.get("target") != target_fingerprint(target)
                    or previous.get("pending", False))
         # 成功检查超过 7 天后再次核对引用；大批量时按最久未尝试的先处理。
@@ -245,6 +252,34 @@ def verify_listed_target(gc, namespace, name, listed, source, private):
         detailed = gc.request(f"/repos/{namespace}/{name}")
         check_target(detailed, source, private)
         return detailed
+
+
+def sync_fork(gh, owner, repo):
+    """让 GitHub 安全合并上游默认分支，不使用强推或重置。"""
+    branch = repo.get("default_branch")
+    if not isinstance(branch, str) or not branch:
+        raise RuntimeError("上游同步失败：无法确认 fork 默认分支")
+    path = f"/repos/{owner}/{repo['name']}"
+    try:
+        response = gh.request(path + "/merge-upstream", "POST", {"branch": branch})
+    except APIError as error:
+        if error.status == 409:
+            raise RuntimeError("上游同步冲突：保留你的提交，本仓库不推送 GitCode，请先手动解决冲突") from None
+        raise RuntimeError(f"上游同步失败（HTTP {error.status}），检查分支、上游状态及 GH_PAT 授权范围") from None
+    except StopRun as error:
+        raise StopRun(f"上游同步停止：{error}；GH_PAT 需覆盖该 fork 并具有 Contents 写入权限") from None
+    if not isinstance(response, dict) or response.get("merge_type") not in ("none", "merge", "fast-forward"):
+        raise RuntimeError("无法确认上游同步结果，本仓库不推送 GitCode")
+    if response["merge_type"] == "none":
+        return repo, False
+    # 上游写入发生后刷新元数据，防止用旧时间戳把刚更新的代码跳过。
+    refreshed = gh.request(path)
+    if (not isinstance(refreshed, dict) or refreshed.get("id") != repo["id"]
+            or refreshed.get("name") != repo["name"]
+            or refreshed.get("owner", {}).get("login", "").lower() != owner.lower()
+            or type(refreshed.get("private")) is not bool):
+        raise RuntimeError("上游已更新，但仓库身份或可见性无法确认，暂不推送 GitCode")
+    return refreshed, True
 
 
 def git(args, env):
@@ -307,17 +342,21 @@ def run():
     if not gc_token:
         raise ValueError("请配置 GC_TOKEN")
     include_private = flag("INCLUDE_PRIVATE")
+    sync_forks = flag("SYNC_FORKS")
     dry_run = flag("DRY_RUN", True)
     gh_pat = os.getenv("GH_PAT", "").strip()
     if include_private and not gh_pat:
         raise ValueError("同步私有仓库必须配置 GH_PAT")
+    if sync_forks and not gh_pat:
+        raise ValueError("自动更新 fork 需要 GH_PAT Secret（Contents 读写）；只备份现有代码可将 SYNC_FORKS 设为 false")
     gh = API("https://api.github.com", gh_pat or os.getenv("GITHUB_TOKEN", ""))
     gc = API("https://api.gitcode.com/api/v5", gc_token)
     if gc.request("/user").get("login", "").lower() != namespace.lower():
         raise ValueError("GC_NAMESPACE 必须是 GC_TOKEN 所属的个人用户名")
-    if include_private:
+    if include_private or sync_forks:
         if gh.request("/user").get("login", "").lower() != owner.lower():
             raise ValueError("GH_PAT 必须属于 GH_OWNER 对应的个人账号")
+    if include_private:
         source_path = "/user/repos?affiliation=owner&visibility=all&sort=full_name"
     else:
         source_path = f"/users/{owner}/repos?type=owner&sort=full_name"
@@ -343,12 +382,13 @@ def run():
         if repo["private"] and not include_private:
             continue
         filtered.append(repo)
-    queue, skipped = candidates(filtered, targets, state.data["repos"], started)
+    queue, skipped = candidates(filtered, targets, state.data["repos"], started, sync_forks)
     current_ids = {str(repo["id"]) for repo in filtered}
     missing = sum(key not in current_ids for key in state.data["repos"])
     if not dry_run:
         git(["lfs", "version"], os.environ.copy())
     created, failed, processed, planned_new, deferred_new, deferred_batch = 0, 0, 0, 0, 0, 0
+    upstream_updated, upstream_current, upstream_failed, mirror_done = 0, 0, 0, 0
     results = []
     print(f"清单：GitHub {len(filtered)} 个，GitCode {len(targets)} 个；候选 {len(queue)}，状态未变跳过 {skipped}")
     if missing:
@@ -381,6 +421,15 @@ def run():
                     deferred_new += 1
                     continue
                 source = f"https://github.com/{owner}/{name}"
+                previous = dict(state.data["repos"].get(key, {}))
+                needs_upstream = sync_forks and repo.get("fork", False) and not repo.get("archived", False)
+                audit = audit or (needs_upstream and "source" in previous
+                                  and started - previous.get("checked", 0) >= 7 * 86400)
+                upstream_pending = needs_upstream and not dry_run
+                updated = False
+                upstream_message = "未启用" if repo.get("fork", False) else "非 fork，无需更新上游"
+                if sync_forks and repo.get("fork", False) and repo.get("archived", False):
+                    upstream_message = "已归档，跳过上游更新"
                 processed += 1
                 result_count = len(results)
                 if not dry_run:
@@ -389,12 +438,33 @@ def run():
                         "attempt": time.time(), "pending": True,
                     }
                 try:
+                    if upstream_pending:
+                        repo, updated = sync_fork(gh, owner, repo)
+                        upstream_pending = False
+                        upstream_updated += int(updated)
+                        upstream_current += int(not updated)
+                        upstream_message = ("已更新" if updated else "已是最新") + f"（{repo['default_branch']}）"
+                        private = repo["private"]
+                        if private and not include_private:
+                            raise RuntimeError("源仓库已改为私有，停止备份；请立即检查 GitCode 可见性")
+                    if needs_upstream and dry_run:
+                        upstream_message = f"预览，将安全同步默认分支 {repo.get('default_branch', '未知')}"
+                    # 上游检查正常且本地状态未变时，不反复补查 GitCode 摘要字段或下载代码。
+                    if (needs_upstream and not dry_run and not updated and not audit and target is not None
+                            and not previous.get("pending", False)
+                            and previous.get("source") == source_fingerprint(repo)
+                            and previous.get("target") == listed_fingerprint):
+                        state.data["repos"][key]["pending"] = False
+                        skipped += 1
+                        mirror_done += 1
+                        results.append(f"{name}: 上游：{upstream_message}；GitCode：状态未变，跳过复查")
+                        continue
                     if target is not None:
                         target = verify_listed_target(gc, namespace, name, target, source, private)
                     if dry_run:
                         if target is None:
                             planned_new += 1
-                        results.append(f"{name}: 预览，{'核对已有镜像' if target else '将新建镜像'}（fork={repo['fork']}，private={private}）")
+                        results.append(f"{name}: 上游：{upstream_message}；GitCode：预览，{'核对已有镜像' if target else '将新建镜像'}（private={private}）")
                         continue
                     if target is None:
                         gc.request("/user/repos", "POST", {
@@ -415,19 +485,22 @@ def run():
                         "target": listed_fingerprint or target_fingerprint(target),
                         "checked": time.time(), "pending": False,
                     })
-                    results.append(f"{name}: {'轮换核对，' if audit else ''}{message}")
+                    mirror_done += 1
+                    results.append(f"{name}: 上游：{upstream_message}；GitCode：{'轮换核对，' if audit else ''}{message}")
                 except BudgetReached:
                     deferred_batch = len(queue) - position
-                    results.append(f"{name}: 时间预算已用完，保存进度，下轮继续")
+                    results.append(f"{name}: 上游：{upstream_message}；GitCode：时间预算已用完，保存进度，下轮继续")
                     break
                 except StopRun as error:
+                    upstream_failed += int(upstream_pending)
                     failed += 1
                     deferred_batch = len(queue) - position
-                    results.append(f"{name}: 本轮停止，{error}")
+                    results.append(f"{name}: 上游：{'失败' if upstream_pending else upstream_message}；本轮停止，{error}")
                     raise
                 except (RuntimeError, ValueError) as error:
+                    upstream_failed += int(upstream_pending)
                     failed += 1
-                    results.append(f"{name}: 失败，{error}")
+                    results.append(f"{name}: 上游：{'失败' if upstream_pending else upstream_message}；GitCode：未完成；{error}")
                     if failed >= 3:
                         deferred_batch = len(queue) - position - 1
                         print("累计 3 个仓库失败，保存已完成进度，停止本轮，请检查配置")
@@ -447,11 +520,22 @@ def run():
                       f"批量/时间待续 {deferred_batch}；源不在范围/不可见 {missing}；"
                       f"API 请求尝试：GitHub {gh.calls + state.api.calls}，GitCode {gc.calls}；"
                       f"进度：{'预览不写入' if dry_run else ('已保存' if saved and state.path else ('本地临时状态' if saved else '保存失败，请查看错误'))}")
+            stages = (f"上游更新 {upstream_updated}；上游已最新 {upstream_current}；上游失败 {upstream_failed}；"
+                      f"GitCode 完成/状态未变 {mirror_done}")
             print(totals, flush=True)
+            print(stages, flush=True)
             if os.getenv("GITHUB_STEP_SUMMARY"):
                 summary = "\n".join(f"- {row}" for row in results) or "本轮没有需要处理的仓库"
+                outcome = "失败，请检查下方记录" if failed or not saved else (
+                    "预览，未执行同步" if dry_run else (
+                        "本批完成，仍有待续项目" if deferred_new or deferred_batch else "本轮完成"
+                    )
+                )
                 Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
-                    f"{totals}\n\n{summary}\n\n完成本轮后结束；下一轮由定时或手动触发。\n",
+                    f"**结果：{outcome}**\n\n{totals}\n\n{stages}\n\n"
+                    f"GitHub 来源查询/上游更新：{gh.calls} 次（{'GH_PAT' if gh_pat else '内置令牌'}）；"
+                    f"状态读写：{state.api.calls} 次（内置令牌）。\n\n{summary}\n\n"
+                    "完成本轮后结束；下一轮由定时或手动触发。\n",
                     encoding="utf-8",
                 )
     return 1 if failed else 0
