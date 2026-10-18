@@ -52,11 +52,34 @@
 
 ## 5. 开启自动运行
 
-在 Variables 新增 `ENABLE_SYNC`，值为 `true`。
+1. 打开 GitHub 控制仓库（不是 GitCode）的 **Settings**。
+2. 左侧点击 **Secrets and variables → Actions**。
+3. 右侧切换到 **Variables** 标签，点击 **New repository variable**。
+4. Name 填 `ENABLE_SYNC`，Value 填小写 `true`，点击 **Add variable**。若已存在此变量，点击铅笔修改即可。
+
+`GC_TOKEN` 和 `GC_NAMESPACE` 已配置成功后不必重填；这个开关是额外的第三项配置，放在 Variables 中。
 
 之后每天北京时间 **02:17、08:17、14:17、20:17** 附近运行。GitHub 定时任务可能延迟，不能保证精确到分钟。手动执行仍然默认仅预览。
 
 暂停定时同步：删除 `ENABLE_SYNC` 或改为 `false`；也可在 Actions 页面禁用工作流。
+
+### 怎么看下一轮是否在执行
+
+打开 **Actions → Mirror to GitCode**，看最新运行的状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| In progress / 黄色转圈 | 本轮正在执行 |
+| Queued / Waiting / Pending | 本轮已经触发，在排队或等待 |
+| Success / 绿色勾 | 这一轮已经结束；不表示下一轮已经开始 |
+| Failure / 红色叉 | 这一轮失败，需要查看具体日志 |
+| Skipped / 跳过 | 若 mirror 作业被跳过，先检查 `ENABLE_SYNC=true` 是否已设置 |
+
+“超出本次新建上限，下次继续”不会立即自动触发下一批。只有下次手动运行或定时时间到达，才会继续；等待下一次定时时间时，页面通常没有倒计时，也不会预先显示一条排队记录。
+
+想立即完成剩余项目：等上一轮结束，点击 **Run workflow**，分支选择 `main`，取消“仅预览”后运行。已有镜像会先检查，一致就跳过完整克隆，再处理剩下的项目。
+
+提交工作流更新本身不会启动同步，已经运行或排队的旧任务也不会自动换成新版本。要立即使用新版，请从工作流页面新建一次 **Run workflow**；不要在旧运行页面点 **Re-run jobs**，后者仍使用旧提交。
 
 ## 可选配置
 
