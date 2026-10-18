@@ -31,22 +31,35 @@ gc_token = os.getenv("GC_TOKEN")
 gc_ns = os.getenv("GC_NAMESPACE")
 gc_api = "https://api.gitcode.com/api/v5"
 
+headers = {"Authorization": f"token {gc_token}"}
+
 for repo in gh.get_user().get_repos():
     repo_name = repo.name
     gh_url = repo.clone_url
-    r = requests.get(f"{gc_api}/repos/{gc_ns}/{repo_name}", params={"access_token": gc_token})
+    # 查询仓库是否存在
+    r = requests.get(f"{gc_api}/repos/{gc_ns}/{repo_name}", headers=headers)
     if r.status_code == 404:
         print(f"[+] GitCode不存在，新建仓库：{repo_name}")
+        # 第一步：新建空仓库
         create_data = {
             "name": repo_name,
-            "private": False,
-            "import_url": gh_url
+            "private": False
         }
-        res = requests.post(f"{gc_api}/user/repos", params={"access_token": gc_token}, json=create_data)
+        res = requests.post(f"{gc_api}/user/repos", headers=headers, json=create_data)
         if res.status_code == 201:
-            print(f"✅ {repo_name} 创建成功，GitCode自动拉取镜像已开启")
+            print(f"✅ 仓库 {repo_name} 创建成功，准备开启镜像")
+            # 第二步：开启拉取镜像（GitCode独立镜像接口）
+            mirror_data = {
+                "source_url": gh_url,
+                "source_branch": "*"
+            }
+            mirror_res = requests.post(f"{gc_api}/repos/{gc_ns}/{repo_name}/mirror/pull", headers=headers, json=mirror_data)
+            if mirror_res.status_code in (200,201):
+                print(f"✅ {repo_name} 镜像同步已开启！")
+            else:
+                print(f"⚠️ 仓库建好，但开启镜像失败：{mirror_res.text}")
         else:
-            print(f"❌ 创建失败 {repo_name}: {res.text}")
+            print(f"❌ 创建仓库失败 {repo_name}: {res.text}")
     else:
         print(f"跳过，仓库已存在：{repo_name}")
 END
