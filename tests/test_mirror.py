@@ -549,8 +549,8 @@ class GitIntegrationTests(unittest.TestCase):
         return subprocess.run(["git", *args], check=True, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", env=self.env).stdout
 
-    def sync(self):
-        return mirror.sync_repo(self.source.as_uri(), self.target.as_uri(), self.env)
+    def sync(self, source_wins=False):
+        return mirror.sync_repo(self.source.as_uri(), self.target.as_uri(), self.env, source_wins=source_wins)
 
     def test_branches_tags_idempotency_and_no_deletion(self):
         self.sync()
@@ -570,6 +570,38 @@ class GitIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "不是快进"):
             self.sync()
         self.assertEqual(mirror.refs(str(self.target), self.env), before)
+
+    def test_source_wins_replaces_rewritten_branches_and_tags_without_deletion(self):
+        self.sync()
+        self.cmd("-C", str(self.target), "branch", "target-only", "main")
+        self.cmd("-C", str(self.source), "commit", "--amend", "-m", "rewritten")
+        self.cmd("-C", str(self.source), "tag", "-f", "v1")
+        self.assertIn("以 GitHub 为准", self.sync(source_wins=True))
+        target_refs = mirror.refs(str(self.target), self.env)
+        for ref, sha in mirror.refs(str(self.source), self.env).items():
+            self.assertEqual(target_refs[ref], sha)
+        self.assertIn("refs/heads/target-only", target_refs)
+
+    def test_source_wins_rejects_concurrent_target_changes_atomically(self):
+        self.sync()
+        self.cmd("-C", str(self.source), "commit", "--amend", "-m", "rewritten")
+        self.cmd("-C", str(self.source), "tag", "v2")
+        original_git = mirror.git
+        concurrent_refs = {}
+
+        def concurrent_push(args, env):
+            if "--atomic" in args:
+                # 模拟核对完成后，其他人在目标分支写入新的提交。
+                self.cmd("-C", str(self.source), "commit", "--allow-empty", "-m", "concurrent")
+                self.cmd("-C", str(self.source), "push", "--force", str(self.target), "main")
+                concurrent_refs.update(mirror.refs(str(self.target), self.env))
+            return original_git(args, env)
+
+        with patch.object(mirror, "git", side_effect=concurrent_push):
+            with self.assertRaisesRegex(RuntimeError, "核对后发生变化"):
+                self.sync(source_wins=True)
+        self.assertEqual(mirror.refs(str(self.target), self.env), concurrent_refs)
+        self.assertNotIn("refs/tags/v2", concurrent_refs)
 
     def test_lfs_objects_are_transferred(self):
         self.cmd("-C", str(self.source), "lfs", "install", "--local")

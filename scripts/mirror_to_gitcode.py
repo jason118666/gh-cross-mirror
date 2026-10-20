@@ -301,6 +301,7 @@ def git(args, env):
         # 只输出固定诊断，不回显可能含令牌的命令、URL 或远端原始错误。
         reasons = [message for pattern, message in (
             (r"non-fast-forward|fetch first", "分支不是快进更新，源和目标历史存在分叉或改写"),
+            (r"stale info", "目标引用在核对后发生变化，本次停止覆盖，下轮重新核对"),
             (r"already exists|would clobber existing tag", "同名标签已存在且指向不同提交"),
             (r"protected branch|protected ref|pre-receive hook declined|hook declined",
              "远端保护规则或接收钩子拒绝推送"),
@@ -315,7 +316,7 @@ def git(args, env):
         ) if re.search(pattern, output, re.IGNORECASE)]
         reason = "；".join(reasons) or "未识别的 Git 错误，需进一步检查远端拒绝原因"
         raise RuntimeError(
-            f"Git {operation} 失败（退出码 {error.returncode}）；{reason}。未启用强制覆盖。"
+            f"Git {operation} 失败（退出码 {error.returncode}）；{reason}。"
         ) from None
     except subprocess.TimeoutExpired:
         if env.get("MIRROR_DEADLINE") and time.time() >= float(env["MIRROR_DEADLINE"]):
@@ -329,7 +330,7 @@ def refs(url, env):
             if not ref.endswith("^{}")}
 
 
-def sync_repo(source_url, target_url, env):
+def sync_repo(source_url, target_url, env, source_wins=False):
     source_refs = refs(source_url, env)
     target_refs = refs(target_url, env)
     # 保留目标独有引用；其余引用一致就不下载完整历史。
@@ -346,9 +347,16 @@ def sync_repo(source_url, target_url, env):
             refspecs.append("refs/heads/*:refs/heads/*")
         if any(ref.startswith("refs/tags/") for ref in source_refs):
             refspecs.append("refs/tags/*:refs/tags/*")
-        # 不强制覆盖、不删除目标分支；一项失败则整组引用都不更新。
-        git(["-C", bare, "push", "--atomic", target_url, *refspecs], env)
-    return "已同步分支和标签"
+        leases = []
+        if source_wins:
+            # 仅覆盖已核对的引用；目标中途变化就整批拒绝，不删除目标独有引用。
+            refspecs = []
+            for ref, sha in source_refs.items():
+                if target_refs.get(ref) != sha:
+                    leases.append(f"--force-with-lease={ref}:{target_refs.get(ref, '')}")
+                    refspecs.append(f"{sha}:{ref}")
+        git(["-C", bare, "push", "--atomic", *leases, target_url, *refspecs], env)
+    return "已同步分支和标签" + ("（以 GitHub 为准，已校验目标旧提交）" if source_wins else "")
 
 
 def run():
@@ -383,6 +391,7 @@ def run():
     targets = target_index(gc.pages("/user/repos?affiliation=owner&visibility=all&sort=full_name"), namespace)
     allow = {name.strip().lower() for name in os.getenv("REPO_ALLOWLIST", "").split(",") if name.strip()}
     exclude = {name.strip().lower() for name in os.getenv("REPO_EXCLUDE", "").split(",") if name.strip()}
+    source_wins_repos = {name.strip().lower() for name in os.getenv("SOURCE_WINS_REPOS", "").split(",") if name.strip()}
     limit = int(os.getenv("MAX_NEW_REPOS", "10"))
     if not 1 <= limit <= 100:
         raise ValueError("MAX_NEW_REPOS 必须为 1 至 100")
@@ -495,7 +504,8 @@ def run():
                         target = gc.request(f"/repos/{namespace}/{name}")
                         check_target(target, source, private)
                         time.sleep(3)
-                    message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{name}.git", env)
+                    message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{name}.git", env,
+                                        source_wins=name.lower() in source_wins_repos)
                     state.data["repos"][key].update({
                         "source": source_fingerprint(repo),
                         # 下轮仍以同一个列表接口比较，避免列表/详情格式差异导致反复补查。

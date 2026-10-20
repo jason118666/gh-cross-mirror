@@ -45,6 +45,8 @@ jobs:
           INCLUDE_PRIVATE: ${{ vars.INCLUDE_PRIVATE || 'false' }}
           REPO_ALLOWLIST: ${{ vars.REPO_ALLOWLIST }}
           REPO_EXCLUDE: ${{ vars.REPO_EXCLUDE }}
+          # 已确认 rea 以 GitHub 为准，允许在校验旧提交后覆盖分叉历史。
+          SOURCE_WINS_REPOS: rea
           MAX_NEW_REPOS: ${{ vars.MAX_NEW_REPOS || '10' }}
           MAX_SYNC_REPOS: ${{ vars.MAX_SYNC_REPOS || '200' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
