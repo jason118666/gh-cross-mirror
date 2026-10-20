@@ -497,6 +497,36 @@ class StateTests(unittest.TestCase):
             mirror.target_index([{"name": "demo"}], "alice")
 
 
+class GitErrorTests(unittest.TestCase):
+    def test_operation_and_reason_are_reported_without_remote_secrets(self):
+        cases = [
+            (["ls-remote", "https://example.test/repo"], "Authentication failed", "ls-remote", "认证失败"),
+            (["clone", "--bare", "source", "repo.git"], "Could not resolve host", "clone", "网络连接"),
+            (["-C", "repo.git", "lfs", "fetch", "--all", "origin"],
+             "Object does not exist on the server", "lfs fetch", "对象或资源不存在"),
+            (["-C", "repo.git", "lfs", "push", "--all", "target"],
+             "quota exceeded", "lfs push", "配额"),
+            (["-C", "repo.git", "push", "--atomic", "target"], "non-fast-forward", "push", "不是快进"),
+            (["push", "target"], "tag (already exists)", "push", "同名标签"),
+            (["push", "target"], "does not support --atomic push", "push", "不支持原子"),
+            (["push", "target"], "protected branch hook declined", "push", "保护规则"),
+            (["push", "target"], "unrecognized failure", "push", "未识别"),
+        ]
+        for args, detail, operation, reason in cases:
+            with self.subTest(detail=detail):
+                error = subprocess.CalledProcessError(
+                    1, ["git", *args], output="secret-token",
+                    stderr=detail + " https://user:secret-token@example.test/repo?token=secret-token",
+                )
+                with patch.object(mirror.subprocess, "run", side_effect=error), self.assertRaises(RuntimeError) as caught:
+                    mirror.git(args, {})
+                message = str(caught.exception)
+                self.assertIn(f"Git {operation} 失败", message)
+                self.assertIn(reason, message)
+                self.assertNotIn("secret-token", message)
+                self.assertNotIn("example.test", message)
+
+
 class GitIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -537,7 +567,7 @@ class GitIntegrationTests(unittest.TestCase):
         before = mirror.refs(str(self.target), self.env)
         self.cmd("-C", str(self.source), "commit", "--amend", "-m", "rewritten")
         self.cmd("-C", str(self.source), "tag", "v2")
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "不是快进"):
             self.sync()
         self.assertEqual(mirror.refs(str(self.target), self.env), before)
 

@@ -295,10 +295,27 @@ def git(args, env):
             check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         ).stdout
     except subprocess.CalledProcessError as error:
-        # 不输出远端原始错误，防止认证信息出现在日志中。
+        command = args[2:] if args[0] == "-C" else args
+        operation = " ".join(command[:2] if command[0] == "lfs" else command[:1])
+        output = (error.stderr or "") + "\n" + (error.stdout or "")
+        # 只输出固定诊断，不回显可能含令牌的命令、URL 或远端原始错误。
+        reasons = [message for pattern, message in (
+            (r"non-fast-forward|fetch first", "分支不是快进更新，源和目标历史存在分叉或改写"),
+            (r"already exists|would clobber existing tag", "同名标签已存在且指向不同提交"),
+            (r"protected branch|protected ref|pre-receive hook declined|hook declined",
+             "远端保护规则或接收钩子拒绝推送"),
+            (r"does not support.*atomic|atomic.*not supported", "目标服务不支持原子推送"),
+            (r"authentication failed|access denied|permission denied|\b40[13]\b",
+             "认证失败或没有访问权限"),
+            (r"repository.*not found", "远端仓库不存在或当前令牌不可见"),
+            (r"missing.*object|object does not exist|\b404\b", "远端对象或资源不存在，检查 LFS 对象是否缺失"),
+            (r"quota|exceed.*limit|file.*too large", "远端配额、文件大小或传输限制"),
+            (r"could not resolve|failed to connect|timed out|connection.*reset|\b50[0234]\b",
+             "网络连接或远端服务异常"),
+        ) if re.search(pattern, output, re.IGNORECASE)]
+        reason = "；".join(reasons) or "未识别的 Git 错误，需进一步检查远端拒绝原因"
         raise RuntimeError(
-            f"Git 失败（退出码 {error.returncode}）；"
-            "检查令牌、分支保护、LFS 或非快进更新。未启用强制覆盖。"
+            f"Git {operation} 失败（退出码 {error.returncode}）；{reason}。未启用强制覆盖。"
         ) from None
     except subprocess.TimeoutExpired:
         if env.get("MIRROR_DEADLINE") and time.time() >= float(env["MIRROR_DEADLINE"]):
