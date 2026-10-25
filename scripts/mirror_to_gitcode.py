@@ -278,11 +278,14 @@ def candidates(repositories, targets, records, now, sync_forks=False, name_map=N
     return ordered, skipped
 
 
-def check_target(target, source, private):
+def check_target(target, source, private, identity=None):
     # 同名不代表归属；只允许推送带有本脚本标记的镜像。
     if not isinstance(target, dict):
         raise RuntimeError("无法读取目标仓库信息，停止同步")
-    if target.get("homepage") != source or target.get("description") != MARKER + source:
+    # 改名镜像可用 GitHub 数字 ID 地址标记归属，避免原名称再次触发元数据审核。
+    markers = {source, identity} if identity else {source}
+    if not any(target.get("homepage") == value and target.get("description") == MARKER + value
+               for value in markers):
         raise RuntimeError("同名仓库没有匹配的镜像标记，已保护；请按 README 核对")
     visibility = target.get("private")
     if visibility is None or type(visibility) not in (bool, int) or visibility not in (0, 1):
@@ -291,15 +294,15 @@ def check_target(target, source, private):
         raise RuntimeError("源与目标可见性不同，停止同步；请先修正目标可见性")
 
 
-def verify_listed_target(gc, namespace, name, listed, source, private):
+def verify_listed_target(gc, namespace, name, listed, source, private, identity=None):
     try:
-        check_target(listed, source, private)
+        check_target(listed, source, private, identity)
         return listed
     except RuntimeError:
         # 列表可能返回空值或摘要值；出现差异先查详情，不能直接认定来源错误。
         print(f"{name}: 列表核验存在差异，补查仓库详情确认", flush=True)
         detailed = gc.request(f"/repos/{namespace}/{name}")
-        check_target(detailed, source, private)
+        check_target(detailed, source, private, identity)
         return detailed
 
 
@@ -499,6 +502,7 @@ def run():
                     deferred_new += 1
                     continue
                 source = f"https://github.com/{owner}/{name}"
+                identity = f"https://api.github.com/repositories/{repo['id']}" if target_name != name else source
                 previous = dict(state.data["repos"].get(key, {}))
                 needs_upstream = sync_forks and repo.get("fork", False) and not repo.get("archived", False)
                 audit = audit or (needs_upstream and "source" in previous
@@ -538,7 +542,7 @@ def run():
                         results.append(f"{label}: 上游：{upstream_message}；GitCode：状态未变，跳过复查")
                         continue
                     if target is not None:
-                        target = verify_listed_target(gc, namespace, target_name, target, source, private)
+                        target = verify_listed_target(gc, namespace, target_name, target, source, private, identity)
                     if dry_run:
                         if target is None:
                             planned_new += 1
@@ -548,13 +552,13 @@ def run():
                         gc.request("/user/repos", "POST", {
                             "name": target_name, "path": target_name, "public": 0 if private else 1,
                             "private": private, "auto_init": False,
-                            "homepage": source, "description": MARKER + source,
+                            "homepage": identity, "description": MARKER + identity,
                             "default_branch": repo.get("default_branch", "main"),
                         })
                         created += 1
                         # 建仓响应成功后仍重新核对可见性，确认后才传输代码。
                         target = gc.request(f"/repos/{namespace}/{target_name}")
-                        check_target(target, source, private)
+                        check_target(target, source, private, identity)
                         time.sleep(3)
                     message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{target_name}.git", env,
                                         source_wins=name.lower() in source_wins_repos)

@@ -132,6 +132,18 @@ class APITests(unittest.TestCase):
 
 
 class NameMapTests(unittest.TestCase):
+    def test_numeric_identity_cannot_match_another_repo_or_mixed_markers(self):
+        source = "https://github.com/alice/demo-vps"
+        identity = "https://api.github.com/repositories/1"
+        target = {"homepage": identity, "description": mirror.MARKER + identity, "private": False}
+        mirror.check_target(target, source, False, identity)
+        for updates in ({"homepage": "https://api.github.com/repositories/2"},
+                        {"description": mirror.MARKER + source}, {"private": True}):
+            with self.subTest(updates=updates), self.assertRaises(RuntimeError):
+                mirror.check_target({**target, **updates}, source, False, identity)
+        with self.assertRaises(RuntimeError):
+            mirror.check_target(target, source, False)
+
     def test_invalid_files_and_colliding_paths_are_rejected(self):
         repos = [{"name": "source"}, {"name": "existing"}]
         for raw in ('bad json', '[]', '{"source":null}', '{"source":"../bad"}',
@@ -147,9 +159,10 @@ class NameMapTests(unittest.TestCase):
         ), self.assertRaises(ValueError):
             mirror.repo_name_map(repos)
 
-    def test_creation_uses_alias_but_keeps_original_ownership_marker(self):
+    def test_creation_uses_alias_and_numeric_identity_without_changing_source(self):
         repo = {"id": 1, "owner": {"login": "alice"}, "name": "demo-vps", "private": False}
         source = "https://github.com/alice/demo-vps"
+        identity = "https://api.github.com/repositories/1"
         calls = []
 
         def request(api, path, method="GET", data=None, missing_ok=False):
@@ -159,7 +172,7 @@ class NameMapTests(unittest.TestCase):
             if method == "POST":
                 return data
             self.assertEqual(path, "/repos/alice/demo")
-            return {"homepage": source, "description": mirror.MARKER + source, "private": False}
+            return {"homepage": identity, "description": mirror.MARKER + identity, "private": False}
 
         with tempfile.TemporaryDirectory() as temporary:
             mapping = Path(temporary) / "repo-name-map.json"
@@ -175,8 +188,8 @@ class NameMapTests(unittest.TestCase):
                 self.assertEqual(mirror.run(), 0)
                 payload = next(data for _, method, data in calls if method == "POST")
                 self.assertEqual((payload["name"], payload["path"]), ("demo", "demo"))
-                self.assertEqual(payload["homepage"], source)
-                self.assertEqual(payload["description"], mirror.MARKER + source)
+                self.assertEqual(payload["homepage"], identity)
+                self.assertEqual(payload["description"], mirror.MARKER + identity)
                 self.assertEqual(sync.call_args.args[:2], (source + ".git", "https://gitcode.com/alice/demo.git"))
 
 
@@ -250,6 +263,23 @@ class IncrementalTests(unittest.TestCase):
                         self.targets[0].update(updates)
                         self.assertEqual(self.execute(), (1, []))
                         self.targets[0] = original
+
+    def test_numeric_mapped_target_allows_preview_sync_and_unchanged_skip(self):
+        self.repos = self.repos[:1]
+        identity = "https://api.github.com/repositories/0"
+        self.targets = [{**self.targets[0], "full_name": "alice/backup", "homepage": identity,
+                         "description": mirror.MARKER + identity}]
+        with tempfile.TemporaryDirectory() as temporary:
+            mapping = Path(temporary) / "repo-name-map.json"
+            mapping.write_text('{"repo0":"backup"}', encoding="utf-8")
+            with patch.object(mirror, "NAME_MAP_FILE", mapping), patch("sys.stdout", new=io.StringIO()):
+                self.variables["DRY_RUN"] = "true"
+                self.assertEqual(self.execute(), (0, []))
+                self.assertEqual(self.state.data["repos"], {})
+                self.variables["DRY_RUN"] = "false"
+                self.assertEqual(self.execute(), (0, ["https://github.com/alice/repo0.git"]))
+                self.assertEqual(self.synced_targets, ["https://gitcode.com/alice/backup.git"])
+                self.assertEqual(self.execute(), (0, []))
 
     def test_batch_resumes_and_unchanged_repos_skip_git(self):
         self.assertEqual(len(self.execute()[1]), 2)
