@@ -70,6 +70,20 @@ schedule:
 | `MAX_NEW_REPOS` | `10` | 每轮新建上限，范围 1～100 |
 | `MAX_SYNC_REPOS` | `200` | 每轮候选处理上限，范围 1～1000 |
 
+## 目标仓库改名映射
+
+GitCode 可能以“项目路径、名称、描述存在违规内容”拒绝建仓，未查到官方公开的完整敏感词清单。已确认的目标名称调整统一维护在根目录的 [`repo-name-map.json`](repo-name-map.json)，左侧是 GitHub 源名称，右侧是 GitCode 目标路径：
+
+```json
+{
+  "xiaoxiaodong-vps": "xiaoxiaodong"
+}
+```
+
+以后遇到同类情况，在文件中追加键值对并提交即可，不必修改 Python 或工作流。未列出的保持同名，填写 `{}` 可取消全部映射。脚本会检查映射后的路径冲突，摘要显示源名称和目标路径。映射只调整 GitCode 名称/路径，GitHub 来源、主页和描述中的归属标记仍保留原地址；不自动删除或迁移旧目标。
+
+手动创建成功的目标可以保留。在 GitCode 的项目设置中，把主页设为 `https://github.com/jason118666/xiaoxiaodong-vps`，描述设为 `Managed by gh-cross-mirror: https://github.com/jason118666/xiaoxiaodong-vps`，并确认可见性与源一致。只有归属和可见性校验通过才会同步；如平台也拒绝这些元数据，需先反馈平台核查。
+
 ## 同步范围与注意事项
 
 - 两边分页读取仓库清单，成功状态保存在控制仓库的独立 `mirror-state` 分支；不要修改或合并该分支。无变化的仓库跳过处理，fork 仍需检查上游；另有分批轮换核对。变化仓库可能需要完整克隆。

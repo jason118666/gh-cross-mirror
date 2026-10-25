@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 MARKER = "Managed by gh-cross-mirror: "
 STATE_BRANCH = "mirror-state"
+NAME_MAP_FILE = Path(__file__).resolve().parent.parent / "repo-name-map.json"
 
 
 class StopRun(RuntimeError):
@@ -27,9 +28,10 @@ class BudgetReached(RuntimeError):
 
 
 class APIError(RuntimeError):
-    def __init__(self, method, status):
+    def __init__(self, method, status, path="", detail=""):
         self.status = status
-        super().__init__(f"API {method} 失败，HTTP {status}")
+        super().__init__(f"API {method} {path} 失败，HTTP {status}".replace("  ", " ")
+                         + (f"；平台原因：{detail}" if detail else ""))
 
 
 def flag(name, default=False):
@@ -80,7 +82,28 @@ class API:
                 if error.code >= 500 and attempt + 1 < attempts:
                     time.sleep(2 ** (attempt + 1))
                     continue
-                raise APIError(method, error.code) from None
+                # 只取平台的诊断字段；不回显请求、完整响应或令牌。
+                detail = ""
+                try:
+                    payload = json.loads(error.read(16384))
+                    if isinstance(payload, dict):
+                        detail = "; ".join(
+                            f"{key}={json.dumps(payload[key], ensure_ascii=False)}"
+                            for key in ("message", "msg", "error", "errors", "error_description",
+                                        "error_message", "error_msg", "code", "error_code")
+                            if payload.get(key) is not None
+                        )
+                except (ValueError, OSError):
+                    pass
+                for token in (self.token, os.getenv("GC_TOKEN", ""), os.getenv("GH_PAT", ""),
+                              os.getenv("GITHUB_TOKEN", "")):
+                    if token:
+                        detail = detail.replace(token, "***")
+                detail = re.sub(r"https?://[^\s\"<>]+", "[URL 已隐藏]", detail)
+                detail = re.sub(r"(?i)(bearer\s+|(?:token|password|secret)[\"\s:=]+)[^\s,;\"}]+",
+                                r"\1***", detail)
+                detail = " ".join(detail.split())[:800] or "平台未提供可用的 JSON 错误信息"
+                raise APIError(method, error.code, path.split("?", 1)[0], detail) from None
             except (URLError, TimeoutError):
                 if attempt + 1 == attempts:
                     raise RuntimeError("API 网络失败；请在下次运行时重新检查") from None
@@ -200,13 +223,39 @@ def target_index(rows, namespace):
     return result
 
 
-def candidates(repositories, targets, records, now, sync_forks=False):
+def repo_name_map(repositories):
+    try:
+        aliases = json.loads(NAME_MAP_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError('无法读取 repo-name-map.json，请检查文件存在且为 JSON 对象，例如 {"source":"target"}') from None
+    if not isinstance(aliases, dict):
+        raise ValueError("repo-name-map.json 必须是 JSON 对象")
+    names = {}
+    for source, target in aliases.items():
+        if not isinstance(target, str):
+            raise ValueError("repo-name-map.json 的目标路径必须是字符串")
+        key = valid_name(source).lower()
+        if key in names:
+            raise ValueError("repo-name-map.json 含大小写重复的源仓库名")
+        names[key] = valid_name(target)
+    destinations = set()
+    for repo in repositories:
+        target = names.get(repo["name"].lower(), repo["name"])
+        # 不允许两个源仓库映射到同一个目标，包含未改名的源仓库。
+        if target.lower() in destinations:
+            raise ValueError(f"GitCode 目标路径冲突：{target}；请调整 repo-name-map.json")
+        destinations.add(target.lower())
+    return names
+
+
+def candidates(repositories, targets, records, now, sync_forks=False, name_map=None):
     selected = []
     skipped = 0
     for repo in repositories:
         key = str(repo["id"])
         previous = records.get(key, {})
-        target = targets.get(repo["name"].lower())
+        target_name = (name_map or {}).get(repo["name"].lower(), repo["name"])
+        target = targets.get(target_name.lower())
         changed = ((sync_forks and repo.get("fork", False) and not repo.get("archived", False))
                    or target is None or previous.get("source") != source_fingerprint(repo)
                    or previous.get("target") != target_fingerprint(target)
@@ -408,7 +457,8 @@ def run():
         if repo["private"] and not include_private:
             continue
         filtered.append(repo)
-    queue, skipped = candidates(filtered, targets, state.data["repos"], started, sync_forks)
+    name_map = repo_name_map(filtered)
+    queue, skipped = candidates(filtered, targets, state.data["repos"], started, sync_forks, name_map)
     current_ids = {str(repo["id"]) for repo in filtered}
     missing = sum(key not in current_ids for key in state.data["repos"])
     if not dry_run:
@@ -439,9 +489,11 @@ def run():
                     deferred_batch = len(queue) - position
                     break
                 name = repo["name"]
+                target_name = name_map.get(name.lower(), name)
+                label = name if name == target_name else f"{name} → {target_name}"
                 private = repo["private"]
                 key = str(repo["id"])
-                target = targets.get(name.lower())
+                target = targets.get(target_name.lower())
                 listed_fingerprint = target_fingerprint(target) if target is not None else None
                 if target is None and (planned_new if dry_run else created) >= limit:
                     deferred_new += 1
@@ -483,28 +535,28 @@ def run():
                         state.data["repos"][key]["pending"] = False
                         skipped += 1
                         mirror_done += 1
-                        results.append(f"{name}: 上游：{upstream_message}；GitCode：状态未变，跳过复查")
+                        results.append(f"{label}: 上游：{upstream_message}；GitCode：状态未变，跳过复查")
                         continue
                     if target is not None:
-                        target = verify_listed_target(gc, namespace, name, target, source, private)
+                        target = verify_listed_target(gc, namespace, target_name, target, source, private)
                     if dry_run:
                         if target is None:
                             planned_new += 1
-                        results.append(f"{name}: 上游：{upstream_message}；GitCode：预览，{'核对已有镜像' if target else '将新建镜像'}（private={private}）")
+                        results.append(f"{label}: 上游：{upstream_message}；GitCode：预览，{'核对已有镜像' if target else '将新建镜像'}（private={private}）")
                         continue
                     if target is None:
                         gc.request("/user/repos", "POST", {
-                            "name": name, "path": name, "public": 0 if private else 1,
+                            "name": target_name, "path": target_name, "public": 0 if private else 1,
                             "private": private, "auto_init": False,
                             "homepage": source, "description": MARKER + source,
                             "default_branch": repo.get("default_branch", "main"),
                         })
                         created += 1
                         # 建仓响应成功后仍重新核对可见性，确认后才传输代码。
-                        target = gc.request(f"/repos/{namespace}/{name}")
+                        target = gc.request(f"/repos/{namespace}/{target_name}")
                         check_target(target, source, private)
                         time.sleep(3)
-                    message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{name}.git", env,
+                    message = sync_repo(source + ".git", f"https://gitcode.com/{namespace}/{target_name}.git", env,
                                         source_wins=name.lower() in source_wins_repos)
                     state.data["repos"][key].update({
                         "source": source_fingerprint(repo),
@@ -513,21 +565,25 @@ def run():
                         "checked": time.time(), "pending": False,
                     })
                     mirror_done += 1
-                    results.append(f"{name}: 上游：{upstream_message}；GitCode：{'轮换核对，' if audit else ''}{message}")
+                    results.append(f"{label}: 上游：{upstream_message}；GitCode：{'轮换核对，' if audit else ''}{message}")
                 except BudgetReached:
                     deferred_batch = len(queue) - position
-                    results.append(f"{name}: 上游：{upstream_message}；GitCode：时间预算已用完，保存进度，下轮继续")
+                    results.append(f"{label}: 上游：{upstream_message}；GitCode：时间预算已用完，保存进度，下轮继续")
                     break
                 except StopRun as error:
                     upstream_failed += int(upstream_pending)
                     failed += 1
                     deferred_batch = len(queue) - position
-                    results.append(f"{name}: 上游：{'失败' if upstream_pending else upstream_message}；本轮停止，{error}")
+                    results.append(f"{label}: 上游：{'失败' if upstream_pending else upstream_message}；本轮停止，{error}")
                     raise
                 except (RuntimeError, ValueError) as error:
                     upstream_failed += int(upstream_pending)
                     failed += 1
-                    results.append(f"{name}: 上游：{'失败' if upstream_pending else upstream_message}；GitCode：未完成；{error}")
+                    results.append(f"{label}: 上游：{'失败' if upstream_pending else upstream_message}；GitCode：未完成；{error}")
+                    # 仅在 Actions 实际同步时生成注解，避免离线测试中的预期失败污染界面。
+                    if os.getenv("GITHUB_ACTIONS") == "true":
+                        annotation = results[-1].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                        print(f"::error::{annotation}", flush=True)
                     if failed >= 3:
                         deferred_batch = len(queue) - position - 1
                         print("累计 3 个仓库失败，保存已完成进度，停止本轮，请检查配置")

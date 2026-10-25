@@ -35,6 +35,34 @@ class APITests(unittest.TestCase):
                 mirror.API("https://example.test", "secret").request("/repo", "POST", {})
             self.assertEqual(request.call_count, 1)
 
+    def test_creation_error_preserves_reason_without_credentials(self):
+        payload = {"message": "path has already been taken", "errors": {"path": ["taken"]},
+                   "error": "Bearer other-secret https://example.test/?token=url-secret api-secret env-secret",
+                   "request": {"password": "must-not-print"}}
+        error = HTTPError("", 400, "", {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.dict(os.environ, {"GH_PAT": "env-secret"}), patch.object(mirror.time, "sleep"), patch.object(
+            mirror, "urlopen", side_effect=error
+        ) as request:
+            with self.assertRaises(mirror.APIError) as caught:
+                mirror.API("https://example.test", "api-secret").request(
+                    "/user/repos?access_token=query-secret", "POST", {"name": "demo"}
+                )
+        message = str(caught.exception)
+        self.assertIn("POST /user/repos", message)
+        self.assertIn("path has already been taken", message)
+        self.assertIn('"path": ["taken"]', message)
+        for secret in ("api-secret", "env-secret", "other-secret", "url-secret", "query-secret", "must-not-print"):
+            self.assertNotIn(secret, message)
+        self.assertEqual(request.call_count, 1)
+
+    def test_invalid_or_large_error_body_keeps_status(self):
+        for body in (b"", b"<html>gateway failure</html>", b"[]", b'{"message":"' + b"x" * 20000):
+            with self.subTest(body=body[:30]), patch.object(mirror.time, "sleep"), patch.object(
+                mirror, "urlopen", side_effect=HTTPError("", 400, "", {}, io.BytesIO(body))
+            ):
+                with self.assertRaisesRegex(mirror.APIError, "HTTP 400"):
+                    mirror.API("https://example.test", "secret").request("/user/repos", "POST", {})
+
     def test_pagination(self):
         api = mirror.API("https://example.test", "secret")
         with patch.object(api, "request", side_effect=[[{}] * 100, [{"name": "last"}]]) as request:
@@ -103,6 +131,55 @@ class APITests(unittest.TestCase):
                     self.assertEqual(sync.call_count, 0 if private else 1)
 
 
+class NameMapTests(unittest.TestCase):
+    def test_invalid_files_and_colliding_paths_are_rejected(self):
+        repos = [{"name": "source"}, {"name": "existing"}]
+        for raw in ('bad json', '[]', '{"source":null}', '{"source":"../bad"}',
+                    '{"source":"existing"}', '{"source":"EXISTING"}',
+                    '{"source":"one","SOURCE":"two"}'):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as temporary:
+                mapping = Path(temporary) / "repo-name-map.json"
+                mapping.write_text(raw, encoding="utf-8")
+                with patch.object(mirror, "NAME_MAP_FILE", mapping), self.assertRaises(ValueError):
+                    mirror.repo_name_map(repos)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            mirror, "NAME_MAP_FILE", Path(temporary) / "missing.json"
+        ), self.assertRaises(ValueError):
+            mirror.repo_name_map(repos)
+
+    def test_creation_uses_alias_but_keeps_original_ownership_marker(self):
+        repo = {"id": 1, "owner": {"login": "alice"}, "name": "demo-vps", "private": False}
+        source = "https://github.com/alice/demo-vps"
+        calls = []
+
+        def request(api, path, method="GET", data=None, missing_ok=False):
+            calls.append((path, method, data))
+            if path == "/user":
+                return {"login": "alice"}
+            if method == "POST":
+                return data
+            self.assertEqual(path, "/repos/alice/demo")
+            return {"homepage": source, "description": mirror.MARKER + source, "private": False}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            mapping = Path(temporary) / "repo-name-map.json"
+            mapping.write_text('{"demo-vps":"demo"}', encoding="utf-8")
+            with patch.object(mirror, "NAME_MAP_FILE", mapping), patch.dict(
+                os.environ, {"GH_OWNER": "alice", "GC_NAMESPACE": "alice", "GC_TOKEN": "secret",
+                             "DRY_RUN": "false"}, clear=True
+            ), patch.object(mirror.API, "request", request), patch.object(
+                mirror.API, "pages", lambda api, path: iter([repo] if "github" in api.base else [])
+            ), patch.object(mirror, "git"), patch.object(mirror.time, "sleep"), patch.object(
+                mirror, "sync_repo", return_value="synced"
+            ) as sync, patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(mirror.run(), 0)
+                payload = next(data for _, method, data in calls if method == "POST")
+                self.assertEqual((payload["name"], payload["path"]), ("demo", "demo"))
+                self.assertEqual(payload["homepage"], source)
+                self.assertEqual(payload["description"], mirror.MARKER + source)
+                self.assertEqual(sync.call_args.args[:2], (source + ".git", "https://gitcode.com/alice/demo.git"))
+
+
 class IncrementalTests(unittest.TestCase):
     def setUp(self):
         self.variables = {"GH_OWNER": "alice", "GC_NAMESPACE": "alice", "GC_TOKEN": "secret",
@@ -139,7 +216,40 @@ class IncrementalTests(unittest.TestCase):
             mirror, "sync_repo", side_effect=effect, return_value="synced"
         ) as sync:
             code = mirror.run()
+            self.synced_targets = [call.args[1] for call in sync.call_args_list]
             return code, [call.args[0] for call in sync.call_args_list]
+
+    def test_mapped_target_uses_original_source_and_resumes_without_recreating(self):
+        self.repos = self.repos[:1]
+        self.targets = [{**self.targets[0], "full_name": "alice/backup"}]
+        # 列表信息不完整时，详情也必须查映射后的路径。
+        self.details["backup"] = dict(self.targets[0])
+        self.targets[0].update({"homepage": "", "description": None})
+        with tempfile.TemporaryDirectory() as temporary:
+            mapping = Path(temporary) / "repo-name-map.json"
+            mapping.write_text('{"repo0":"backup"}', encoding="utf-8")
+            with patch.object(mirror, "NAME_MAP_FILE", mapping), patch("sys.stdout", new=io.StringIO()) as output:
+                code, sources = self.execute()
+                self.assertEqual(code, 0)
+                self.assertEqual(sources, ["https://github.com/alice/repo0.git"])
+                self.assertEqual(self.synced_targets, ["https://gitcode.com/alice/backup.git"])
+                self.assertIn("repo0 → backup", output.getvalue())
+                self.assertTrue(any(path == "/repos/alice/backup" for _, path, _ in self.requests))
+                self.assertEqual(self.execute(), (0, []))
+
+    def test_mapped_target_still_rejects_unmanaged_or_wrong_visibility(self):
+        self.repos = self.repos[:1]
+        self.targets = [{**self.targets[0], "full_name": "alice/backup"}]
+        with tempfile.TemporaryDirectory() as temporary:
+            mapping = Path(temporary) / "repo-name-map.json"
+            mapping.write_text('{"repo0":"backup"}', encoding="utf-8")
+            with patch.object(mirror, "NAME_MAP_FILE", mapping):
+                for updates in ({"description": "unrelated"}, {"private": True}):
+                    with self.subTest(updates=updates), patch("sys.stdout", new=io.StringIO()):
+                        original = dict(self.targets[0])
+                        self.targets[0].update(updates)
+                        self.assertEqual(self.execute(), (1, []))
+                        self.targets[0] = original
 
     def test_batch_resumes_and_unchanged_repos_skip_git(self):
         self.assertEqual(len(self.execute()[1]), 2)
